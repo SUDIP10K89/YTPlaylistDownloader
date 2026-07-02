@@ -74,7 +74,7 @@ def download_video():
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
-    print("\n✅ Video download complete!")
+    print("\n Video download complete!")
 
 def download_playlist_video():
     url = input("\nEnter YouTube playlist URL: ").strip()
