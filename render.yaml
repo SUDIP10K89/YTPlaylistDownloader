@@ -7,7 +7,7 @@ services:
     name: spool-api
     runtime: docker
     dockerfilePath: ./Dockerfile
-    plan: starter   # free tier spins down on inactivity, which will kill
+    plan: free   # free tier spins down on inactivity, which will kill
                      # any download running in the background — use at
                      # least Starter if you want downloads to reliably finish
     envVars:
