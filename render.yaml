@@ -1,0 +1,23 @@
+# Render Blueprint. If you connect this repo and Render finds this file,
+# it'll pre-fill the service config below. You still need to fill in the
+# "sync: false" values (MONGO_URI, CORS_ALLOWED_ORIGINS) yourself in the
+# dashboard, since those are specific to your Atlas cluster and Vercel URL.
+services:
+  - type: web
+    name: spool-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter   # free tier spins down on inactivity, which will kill
+                     # any download running in the background — use at
+                     # least Starter if you want downloads to reliably finish
+    envVars:
+      - key: MONGO_URI
+        sync: false          # paste your MongoDB Atlas connection string in the dashboard
+      - key: MONGO_DB_NAME
+        value: ytdlp_downloader
+      - key: FFMPEG_PATH
+        value: /usr/bin
+      - key: YTDLP_REMOTE_COMPONENTS
+        value: ejs:github
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false          # set to your Vercel URL, e.g. https://spool.vercel.app

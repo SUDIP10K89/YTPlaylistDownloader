@@ -1,36 +1,3 @@
-"""
-YouTube Downloader API (FastAPI + MongoDB)
-
-Converts the original CLI script into a web API with background jobs.
-Job state is persisted in MongoDB, files are cleaned up off disk after
-they're served, and jobs are scoped per browser/client so people sharing
-this API don't see each other's history.
-
-Run with:
-    uvicorn main:app --reload
-
-Requires a running MongoDB instance. Configure via a .env file in the
-working directory (see .env.example), or real environment variables:
-    MONGO_URI=mongodb://localhost:27017
-    MONGO_DB_NAME=ytdlp_downloader
-    FFMPEG_PATH=./ffmpeg-2026-06-29-git-de6bcf5c05-essentials_build/bin
-
-Every request (except the bare docs) must include a client id, either as
-an `X-Client-Id` header or a `client_id` query param. The frontend
-generates and persists one automatically. Jobs are only ever visible to
-the client id that created them.
-
-Endpoints:
-    POST /download/audio            -> single video, mp3
-    POST /download/playlist-audio   -> playlist range, mp3 (zipped if >1 file)
-    POST /download/video            -> single video, mp4
-    POST /download/playlist-video   -> playlist range, mp4 (zipped if >1 file)
-    GET  /jobs/{job_id}             -> check status / progress
-    GET  /jobs/{job_id}/file        -> download the finished file(s); deletes
-                                        the file(s) from disk once served
-    GET  /jobs                      -> list this client's jobs
-"""
-
 import os
 import re
 import shutil
@@ -87,16 +54,21 @@ def _base_ydl_opts() -> dict:
 
 app = FastAPI(title="YouTube Downloader API", version="3.0.0")
 
-# Allow the local frontend (served from a different origin/port, or opened
-# directly as a file://) to call this API from the browser.
+
+_cors_origins_raw = os.environ.get("CORS_ALLOWED_ORIGINS", "*")
+CORS_ALLOWED_ORIGINS = (
+    ["*"] if _cors_origins_raw.strip() == "*"
+    else [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- MongoDB setup ----------
+
 
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client[MONGO_DB_NAME]
@@ -110,7 +82,7 @@ def check_mongo_connection():
     try:
         mongo_client.admin.command("ping")
     except PyMongoError as e:
-        # Fail loudly at startup rather than on the first request.
+        
         raise RuntimeError(f"Could not connect to MongoDB at {MONGO_URI}: {e}")
 
 
@@ -121,10 +93,7 @@ class JobStatus(str, Enum):
     FAILED = "failed"
 
 
-# ---------- Client identity ----------
-# There's no login system here, just a per-browser random id the frontend
-# generates once and persists (localStorage) so a person's own downloads
-# stay separate from anyone else's using the same server.
+
 
 def get_client_id(
     x_client_id: str | None = Header(None, alias="X-Client-Id"),
@@ -139,7 +108,7 @@ def get_client_id(
     return cid
 
 
-# ---------- Request models ----------
+
 
 class SingleDownloadRequest(BaseModel):
     url: str = Field(..., description="YouTube video URL")
