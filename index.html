@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Spool — pull audio and video from any link</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #14161c;
+    --surface: #1b1e27;
+    --surface-2: #21242f;
+    --border: #2c303c;
+    --text: #edeef2;
+    --muted: #8b8f9e;
+    --amber: #e8a33d;
+    --teal: #4fd1c5;
+    --danger: #e5595c;
+    --success: #5cc98a;
+  }
+  html, body { background: var(--ink); color: var(--text); }
+  .font-display { font-family: 'Space Grotesk', sans-serif; }
+  .font-mono { font-family: 'IBM Plex Mono', monospace; }
+  .font-body { font-family: 'Inter', sans-serif; }
+
+  .vu-bars { display: flex; align-items: flex-end; gap: 2px; height: 16px; }
+  .vu-bars span {
+    width: 3px; background: var(--amber); border-radius: 1px;
+    animation: vu 900ms ease-in-out infinite;
+  }
+  .vu-bars span:nth-child(1) { height: 40%; animation-delay: 0ms; }
+  .vu-bars span:nth-child(2) { height: 100%; animation-delay: 120ms; }
+  .vu-bars span:nth-child(3) { height: 65%; animation-delay: 240ms; }
+  .vu-bars span:nth-child(4) { height: 85%; animation-delay: 60ms; }
+  .vu-bars span:nth-child(5) { height: 50%; animation-delay: 180ms; }
+  @keyframes vu {
+    0%, 100% { transform: scaleY(0.4); opacity: .7; }
+    50% { transform: scaleY(1); opacity: 1; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .vu-bars span { animation: none; height: 70% !important; }
+  }
+
+  .mode-btn.active { background: var(--amber); color: #14161c; border-color: var(--amber); }
+  .type-btn.active { background: var(--surface-2); border-color: var(--teal); color: var(--teal); }
+
+  input[type="text"]:focus, input[type="number"]:focus, button:focus-visible {
+    outline: 2px solid var(--teal); outline-offset: 2px;
+  }
+
+  .dot { width: 6px; height: 6px; border-radius: 999px; display: inline-block; }
+</style>
+</head>
+<body class="font-body min-h-screen">
+
+<div class="max-w-3xl mx-auto px-6 py-14">
+
+  <!-- Header -->
+  <header class="mb-10 border-b pb-8" style="border-color: var(--border);">
+    <div class="flex items-baseline gap-3">
+      <h1 class="font-display text-4xl font-bold tracking-tight">Spool</h1>
+      <span class="font-mono text-xs" style="color: var(--muted);">v2.0</span>
+    </div>
+    <p class="mt-2 font-body" style="color: var(--muted);">Pull audio or video off a link. Queue it, walk away, come back to a finished file.</p>
+    <p id="api-status" class="mt-3 font-mono text-xs" style="color: var(--muted);">checking api…</p>
+  </header>
+
+  <!-- Input deck -->
+  <section class="rounded-lg p-6 mb-10" style="background: var(--surface); border: 1px solid var(--border);">
+    <label for="url" class="block font-mono text-xs mb-2 uppercase tracking-wide" style="color: var(--muted);">Link</label>
+    <input id="url" type="text" placeholder="https://youtube.com/watch?v=… or a playlist link"
+      class="w-full rounded-md px-4 py-3 font-mono text-sm mb-5"
+      style="background: var(--surface-2); border: 1px solid var(--border); color: var(--text);" />
+
+    <div class="flex flex-wrap gap-6 mb-5">
+      <div>
+        <div class="font-mono text-xs mb-2 uppercase tracking-wide" style="color: var(--muted);">Format</div>
+        <div class="flex gap-2">
+          <button type="button" data-mode="audio" class="mode-btn active px-4 py-2 rounded-md text-sm font-medium border transition" style="border-color: var(--border); color: var(--text);">Audio · mp3</button>
+          <button type="button" data-mode="video" class="mode-btn px-4 py-2 rounded-md text-sm font-medium border transition" style="border-color: var(--border); color: var(--text);">Video · mp4</button>
+        </div>
+      </div>
+      <div>
+        <div class="font-mono text-xs mb-2 uppercase tracking-wide" style="color: var(--muted);">Source</div>
+        <div class="flex gap-2">
+          <button type="button" data-type="single" class="type-btn active px-4 py-2 rounded-md text-sm font-medium border transition" style="border-color: var(--border); color: var(--text);">Single</button>
+          <button type="button" data-type="playlist" class="type-btn px-4 py-2 rounded-md text-sm font-medium border transition" style="border-color: var(--border); color: var(--text);">Playlist</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="range-row" class="hidden flex-wrap gap-4 mb-5 items-end">
+      <div>
+        <label for="start" class="block font-mono text-xs mb-2 uppercase tracking-wide" style="color: var(--muted);">Start</label>
+        <input id="start" type="number" min="1" value="1" class="w-24 rounded-md px-3 py-2 font-mono text-sm" style="background: var(--surface-2); border: 1px solid var(--border); color: var(--text);" />
+      </div>
+      <div>
+        <label for="end" class="block font-mono text-xs mb-2 uppercase tracking-wide" style="color: var(--muted);">End</label>
+        <input id="end" type="number" min="1" value="10" class="w-24 rounded-md px-3 py-2 font-mono text-sm" style="background: var(--surface-2); border: 1px solid var(--border); color: var(--text);" />
+      </div>
+    </div>
+
+    <button id="submit" class="w-full rounded-md py-3 font-semibold text-sm transition" style="background: var(--amber); color: #14161c;">
+      Add to queue
+    </button>
+    <p id="form-error" class="hidden mt-3 font-mono text-xs" style="color: var(--danger);"></p>
+  </section>
+
+  <!-- Queue -->
+  <section>
+    <div class="flex items-baseline justify-between mb-4">
+      <h2 class="font-display text-lg font-bold">Queue</h2>
+      <span id="queue-count" class="font-mono text-xs" style="color: var(--muted);">0 tracks</span>
+    </div>
+    <div id="queue" class="space-y-2"></div>
+    <p id="empty-state" class="font-mono text-sm py-10 text-center" style="color: var(--muted);">Nothing queued yet. Paste a link above to start.</p>
+  </section>
+
+</div>
+
+<script>
+const API_BASE = "http://localhost:8000";
+
+// A random id, generated once and persisted, so this browser's downloads
+// stay separate from anyone else's using the same API server.
+function getClientId() {
+  let id = localStorage.getItem("spool_client_id");
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem("spool_client_id", id);
+  }
+  return id;
+}
+const CLIENT_ID = getClientId();
+
+function apiFetch(path, options = {}) {
+  const headers = { ...(options.headers || {}), "X-Client-Id": CLIENT_ID };
+  return fetch(API_BASE + path, { ...options, headers });
+}
+function fileUrl(jobId) {
+  return `${API_BASE}/jobs/${jobId}/file?client_id=${encodeURIComponent(CLIENT_ID)}`;
+}
+
+const els = {
+  url: document.getElementById("url"),
+  submit: document.getElementById("submit"),
+  formError: document.getElementById("form-error"),
+  rangeRow: document.getElementById("range-row"),
+  start: document.getElementById("start"),
+  end: document.getElementById("end"),
+  queue: document.getElementById("queue"),
+  queueCount: document.getElementById("queue-count"),
+  emptyState: document.getElementById("empty-state"),
+  apiStatus: document.getElementById("api-status"),
+};
+
+let mode = "audio";     // audio | video
+let sourceType = "single"; // single | playlist
+
+document.querySelectorAll(".mode-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    mode = btn.dataset.mode;
+    document.querySelectorAll(".mode-btn").forEach(b => b.classList.toggle("active", b === btn));
+  });
+});
+
+document.querySelectorAll(".type-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    sourceType = btn.dataset.type;
+    document.querySelectorAll(".type-btn").forEach(b => b.classList.toggle("active", b === btn));
+    els.rangeRow.classList.toggle("hidden", sourceType !== "playlist");
+    els.rangeRow.classList.toggle("flex", sourceType === "playlist");
+  });
+});
+
+function showError(msg) {
+  els.formError.textContent = msg;
+  els.formError.classList.remove("hidden");
+}
+function clearError() {
+  els.formError.classList.add("hidden");
+}
+
+async function submitJob() {
+  clearError();
+  const url = els.url.value.trim();
+  if (!url) { showError("Paste a link first."); return; }
+
+  let endpoint, body;
+  if (sourceType === "single") {
+    endpoint = mode === "audio" ? "/download/audio" : "/download/video";
+    body = { url };
+  } else {
+    const start = parseInt(els.start.value, 10);
+    const end = parseInt(els.end.value, 10);
+    if (!start || !end || end < start) { showError("Check the start/end range."); return; }
+    endpoint = mode === "audio" ? "/download/playlist-audio" : "/download/playlist-video";
+    body = { url, start, end };
+  }
+
+  els.submit.disabled = true;
+  els.submit.textContent = "Adding…";
+  try {
+    const res = await apiFetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `Request failed (${res.status})`);
+    }
+    els.url.value = "";
+    await refreshQueue();
+  } catch (e) {
+    showError(e.message || "Couldn't reach the API. Is it running?");
+  } finally {
+    els.submit.disabled = false;
+    els.submit.textContent = "Add to queue";
+  }
+}
+
+els.submit.addEventListener("click", submitJob);
+els.url.addEventListener("keydown", e => { if (e.key === "Enter") submitJob(); });
+
+const STATUS_META = {
+  pending:   { label: "Queued",   color: "var(--muted)" },
+  running:   { label: "Pulling",  color: "var(--amber)" },
+  completed: { label: "Ready",    color: "var(--success)" },
+  failed:    { label: "Failed",   color: "var(--danger)" },
+};
+
+function jobTitle(job) {
+  if (job.title) return job.title;
+  // No title resolved yet (job just started) — fall back to something
+  // more readable than the raw query string.
+  try {
+    const u = new URL(job.url);
+    if (u.searchParams.get("list")) return "Playlist · resolving title…";
+    if (u.searchParams.get("v")) return "Video · resolving title…";
+    return u.hostname + u.pathname;
+  } catch {
+    return job.url;
+  }
+}
+
+function jobRowHTML(job, index) {
+  const meta = STATUS_META[job.status] || STATUS_META.pending;
+  const isRunning = job.status === "running";
+  const percent = job.progress && job.progress.percent ? job.progress.percent : null;
+
+  return `
+    <span class="font-mono text-xs w-6 shrink-0" style="color: var(--muted);">${String(index + 1).padStart(2, "0")}</span>
+    <div class="min-w-0 flex-1">
+      <p class="font-mono text-sm truncate">${jobTitle(job)}</p>
+      <p class="font-mono text-xs mt-0.5" style="color: var(--muted);">${job.type}${percent ? " · " + percent : ""}</p>
+      ${job.status === "failed" && job.error ? `<p class="font-mono text-xs mt-1" style="color: var(--danger);">${job.error.slice(0, 120)}</p>` : ""}
+    </div>
+    ${isRunning ? `<div class="vu-bars shrink-0"><span></span><span></span><span></span><span></span><span></span></div>` : ""}
+    <span class="dot shrink-0" style="background: ${meta.color};"></span>
+    <span class="font-mono text-xs w-16 shrink-0" style="color: ${meta.color};">${meta.label}</span>
+    ${job.status === "completed"
+      ? `<a href="${fileUrl(job.job_id)}" class="shrink-0 font-mono text-xs px-3 py-1.5 rounded border transition" style="border-color: var(--teal); color: var(--teal);">Download</a>`
+      : `<span class="shrink-0 w-[76px]"></span>`}
+  `;
+}
+
+// Keyed diff renderer: only touches DOM nodes whose job actually changed,
+// so polling every few seconds doesn't repaint/flicker the whole list or
+// restart animations on rows that haven't moved.
+const rowElements = new Map(); // job_id -> element
+const rowSignatures = new Map(); // job_id -> last-rendered signature string
+
+function jobSignature(job) {
+  const percent = job.progress && job.progress.percent ? job.progress.percent : "";
+  return `${job.status}|${job.title || ""}|${percent}|${job.error || ""}`;
+}
+
+function renderQueue(jobs) {
+  els.emptyState.classList.toggle("hidden", jobs.length !== 0);
+  els.queueCount.textContent = `${jobs.length} track${jobs.length === 1 ? "" : "s"}`;
+
+  const seenIds = new Set();
+
+  jobs.forEach((job, index) => {
+    seenIds.add(job.job_id);
+    const sig = jobSignature(job) + `|${index}`;
+
+    let row = rowElements.get(job.job_id);
+    if (!row) {
+      row = document.createElement("div");
+      row.className = "flex items-center gap-4 rounded-md px-4 py-3";
+      row.style.background = "var(--surface)";
+      row.style.border = "1px solid var(--border)";
+      rowElements.set(job.job_id, row);
+    }
+
+    // Only touch innerHTML (and therefore restart the VU-bar animation)
+    // if something about this job actually changed since last poll.
+    if (rowSignatures.get(job.job_id) !== sig) {
+      row.innerHTML = jobRowHTML(job, index);
+      rowSignatures.set(job.job_id, sig);
+    }
+
+    // Keep DOM order in sync with the jobs array without rebuilding nodes.
+    const current = els.queue.children[index];
+    if (current !== row) {
+      els.queue.insertBefore(row, current || null);
+    }
+  });
+
+  // Remove rows for jobs that no longer exist (e.g. cleared server-side).
+  for (const [jobId, row] of rowElements) {
+    if (!seenIds.has(jobId)) {
+      row.remove();
+      rowElements.delete(jobId);
+      rowSignatures.delete(jobId);
+    }
+  }
+}
+
+async function refreshQueue() {
+  try {
+    const res = await apiFetch("/jobs");
+    if (!res.ok) throw new Error();
+    const jobs = await res.json();
+    els.apiStatus.textContent = "api connected";
+    els.apiStatus.style.color = "var(--success)";
+    renderQueue(jobs);
+  } catch {
+    els.apiStatus.textContent = "api unreachable — check the server is running on " + API_BASE;
+    els.apiStatus.style.color = "var(--danger)";
+  }
+}
+
+refreshQueue();
+setInterval(refreshQueue, 2500);
+</script>
+
+</body>
+</html>

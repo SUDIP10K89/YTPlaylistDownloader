@@ -2,8 +2,9 @@
 YouTube Downloader API (FastAPI + MongoDB)
 
 Converts the original CLI script into a web API with background jobs.
-Job state is persisted in MongoDB instead of an in-memory dict, so jobs
-survive server restarts and are visible across multiple worker processes.
+Job state is persisted in MongoDB, files are cleaned up off disk after
+they're served, and jobs are scoped per browser/client so people sharing
+this API don't see each other's history.
 
 Run with:
     uvicorn main:app --reload
@@ -14,28 +15,40 @@ working directory (see .env.example), or real environment variables:
     MONGO_DB_NAME=ytdlp_downloader
     FFMPEG_PATH=./ffmpeg-2026-06-29-git-de6bcf5c05-essentials_build/bin
 
+Every request (except the bare docs) must include a client id, either as
+an `X-Client-Id` header or a `client_id` query param. The frontend
+generates and persists one automatically. Jobs are only ever visible to
+the client id that created them.
+
 Endpoints:
     POST /download/audio            -> single video, mp3
-    POST /download/playlist-audio   -> playlist range, mp3
+    POST /download/playlist-audio   -> playlist range, mp3 (zipped if >1 file)
     POST /download/video            -> single video, mp4
-    POST /download/playlist-video   -> playlist range, mp4
+    POST /download/playlist-video   -> playlist range, mp4 (zipped if >1 file)
     GET  /jobs/{job_id}             -> check status / progress
-    GET  /jobs/{job_id}/file        -> download the finished file
-    GET  /jobs                      -> list all jobs
+    GET  /jobs/{job_id}/file        -> download the finished file(s); deletes
+                                        the file(s) from disk once served
+    GET  /jobs                      -> list this client's jobs
 """
 
 import os
+import re
+import shutil
+import tempfile
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from enum import Enum
 
 import yt_dlp
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
+from starlette.background import BackgroundTask
 
 load_dotenv()  # reads variables from a .env file in the working directory, if present
 
@@ -71,7 +84,17 @@ def _base_ydl_opts() -> dict:
         opts["remote_components"] = YTDLP_REMOTE_COMPONENTS
     return opts
 
-app = FastAPI(title="YouTube Downloader API", version="2.0.0")
+
+app = FastAPI(title="YouTube Downloader API", version="3.0.0")
+
+# Allow the local frontend (served from a different origin/port, or opened
+# directly as a file://) to call this API from the browser.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---------- MongoDB setup ----------
 
@@ -79,6 +102,7 @@ mongo_client = MongoClient(MONGO_URI)
 db = mongo_client[MONGO_DB_NAME]
 jobs_collection = db["jobs"]
 jobs_collection.create_index("job_id", unique=True)
+jobs_collection.create_index("owner_id")
 
 
 @app.on_event("startup")
@@ -97,6 +121,24 @@ class JobStatus(str, Enum):
     FAILED = "failed"
 
 
+# ---------- Client identity ----------
+# There's no login system here, just a per-browser random id the frontend
+# generates once and persists (localStorage) so a person's own downloads
+# stay separate from anyone else's using the same server.
+
+def get_client_id(
+    x_client_id: str | None = Header(None, alias="X-Client-Id"),
+    client_id: str | None = Query(None),
+) -> str:
+    cid = x_client_id or client_id
+    if not cid:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing client id. Send it as an X-Client-Id header or client_id query param.",
+        )
+    return cid
+
+
 # ---------- Request models ----------
 
 class SingleDownloadRequest(BaseModel):
@@ -113,17 +155,19 @@ class PlaylistDownloadRequest(BaseModel):
 # which is fine here since yt-dlp itself is blocking and runs in a
 # background thread anyway) ----------
 
-def _new_job(job_type: str, url: str) -> str:
+def _new_job(job_type: str, url: str, owner_id: str) -> str:
     job_id = str(uuid.uuid4())
     jobs_collection.insert_one(
         {
             "job_id": job_id,
+            "owner_id": owner_id,
             "type": job_type,
             "url": url,
+            "title": None,  # set once yt-dlp resolves the real video/playlist title
             "status": JobStatus.PENDING,
             "progress": None,
             "error": None,
-            "file": None,
+            "files": [],  # every finished file path for this job (1 for single, N for playlist)
             "created_at": datetime.now(timezone.utc),
             "updated_at": datetime.now(timezone.utc),
         }
@@ -131,59 +175,126 @@ def _new_job(job_type: str, url: str) -> str:
     return job_id
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _clean(s) -> str:
+    """Strip terminal ANSI color codes yt-dlp embeds in its progress strings
+    (meant for a terminal, not a browser) so the UI doesn't show garbage
+    characters like the escape sequences around '100.0%'."""
+    return _ANSI_RE.sub("", s).strip() if s else ""
+
+
 def _update_job(job_id: str, **fields):
     fields["updated_at"] = datetime.now(timezone.utc)
     jobs_collection.update_one({"job_id": job_id}, {"$set": fields})
 
 
-def _get_job(job_id: str) -> dict | None:
-    return jobs_collection.find_one({"job_id": job_id}, {"_id": 0})
+def _append_job_file(job_id: str, filepath: str):
+    jobs_collection.update_one(
+        {"job_id": job_id},
+        {"$addToSet": {"files": filepath}, "$set": {"updated_at": datetime.now(timezone.utc)}},
+    )
 
 
-def _make_progress_hook(job_id: str):
+def _get_job(job_id: str, owner_id: str) -> dict | None:
+    # Scoped by owner_id so one client can't look up another client's job_id.
+    return jobs_collection.find_one({"job_id": job_id, "owner_id": owner_id}, {"_id": 0})
+
+
+def _job_title_from_info(job_type: str, info: dict) -> str | None:
+    """Prefer the playlist title for playlist jobs, the video title otherwise."""
+    if not info:
+        return None
+    if job_type.startswith("playlist"):
+        return info.get("playlist_title") or info.get("playlist") or info.get("title")
+    return info.get("title")
+
+
+def _make_progress_hook(job_id: str, job_type: str, title_state: dict):
     def hook(d):
         if d["status"] == "downloading":
-            _update_job(
-                job_id,
-                status=JobStatus.RUNNING,
-                progress={
+            fields = {
+                "status": JobStatus.RUNNING,
+                "progress": {
                     "filename": d.get("filename"),
-                    "percent": d.get("_percent_str", "").strip(),
-                    "speed": d.get("_speed_str", "").strip(),
-                    "eta": d.get("_eta_str", "").strip(),
+                    "percent": _clean(d.get("_percent_str", "")),
+                    "speed": _clean(d.get("_speed_str", "")),
+                    "eta": _clean(d.get("_eta_str", "")),
                 },
-            )
+            }
+            # Grab the real title the first time yt-dlp resolves it, instead
+            # of leaving the queue showing the raw URL for the whole download.
+            if not title_state["set"]:
+                title = _job_title_from_info(job_type, d.get("info_dict") or {})
+                if title:
+                    fields["title"] = title
+                    title_state["set"] = True
+            _update_job(job_id, **fields)
     return hook
 
 
-def _make_postprocessor_hook(job_id: str):
+def _make_postprocessor_hook(job_id: str, job_type: str, title_state: dict):
     # Fires after ffmpeg finishes (e.g. mp4 merge, mp3 extraction), so this
-    # gives the *actual* final filename rather than the pre-conversion temp file.
+    # gives the *actual* final filename rather than the pre-conversion temp
+    # file. Appends rather than overwrites, since a playlist job produces
+    # one "finished" event per track.
     def hook(d):
         if d["status"] == "finished":
-            filepath = d.get("info_dict", {}).get("filepath")
+            info = d.get("info_dict", {})
+            filepath = info.get("filepath")
             if filepath:
-                _update_job(job_id, file=filepath)
+                _append_job_file(job_id, filepath)
+            if not title_state["set"]:
+                title = _job_title_from_info(job_type, info)
+                if title:
+                    _update_job(job_id, title=title)
+                    title_state["set"] = True
     return hook
 
 
-def _run_download(job_id: str, ydl_opts: dict, url: str):
-    ydl_opts["progress_hooks"] = [_make_progress_hook(job_id)]
-    ydl_opts["postprocessor_hooks"] = [_make_postprocessor_hook(job_id)]
+def _run_download(job_id: str, job_type: str, ydl_opts: dict, url: str):
+    title_state = {"set": False}
+    ydl_opts["progress_hooks"] = [_make_progress_hook(job_id, job_type, title_state)]
+    ydl_opts["postprocessor_hooks"] = [_make_postprocessor_hook(job_id, job_type, title_state)]
     _update_job(job_id, status=JobStatus.RUNNING)
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        _update_job(job_id, status=JobStatus.COMPLETED)
+            info = ydl.extract_info(url, download=True)
+        fields = {"status": JobStatus.COMPLETED}
+        if not title_state["set"]:
+            title = _job_title_from_info(job_type, info or {})
+            if title:
+                fields["title"] = title
+        _update_job(job_id, **fields)
     except Exception as e:
         _update_job(job_id, status=JobStatus.FAILED, error=str(e))
+
+
+def _cleanup_paths(*paths: str):
+    """Best-effort delete of files (and their now-possibly-empty parent dirs)."""
+    for path in paths:
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                parent = os.path.dirname(path)
+                if parent and os.path.isdir(parent) and not os.listdir(parent):
+                    os.rmdir(parent)
+            elif os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass  # never let cleanup crash a response that already succeeded
 
 
 # ---------- Endpoints ----------
 
 @app.post("/download/audio")
-def download_audio(req: SingleDownloadRequest, background_tasks: BackgroundTasks):
-    job_id = _new_job("audio", req.url)
+def download_audio(
+    req: SingleDownloadRequest,
+    background_tasks: BackgroundTasks,
+    owner_id: str = Depends(get_client_id),
+):
+    job_id = _new_job("audio", req.url, owner_id)
     ydl_opts = {
         **_base_ydl_opts(),
         "format": "bestaudio/best",
@@ -193,20 +304,24 @@ def download_audio(req: SingleDownloadRequest, background_tasks: BackgroundTasks
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
         ],
     }
-    background_tasks.add_task(_run_download, job_id, ydl_opts, req.url)
+    background_tasks.add_task(_run_download, job_id, "audio", ydl_opts, req.url)
     return {"job_id": job_id, "status": JobStatus.PENDING}
 
 
 @app.post("/download/playlist-audio")
-def download_playlist_audio(req: PlaylistDownloadRequest, background_tasks: BackgroundTasks):
+def download_playlist_audio(
+    req: PlaylistDownloadRequest,
+    background_tasks: BackgroundTasks,
+    owner_id: str = Depends(get_client_id),
+):
     if req.end < req.start:
         raise HTTPException(status_code=400, detail="end must be >= start")
 
-    job_id = _new_job("playlist-audio", req.url)
+    job_id = _new_job("playlist-audio", req.url, owner_id)
     ydl_opts = {
         **_base_ydl_opts(),
         "format": "bestaudio/best",
-        "outtmpl": "Playlist Audio/%(playlist)s/%(playlist_index)s - %(title)s.%(ext)s",
+        "outtmpl": f"Playlist Audio/{job_id}/%(playlist_index)s - %(title)s.%(ext)s",
         "playliststart": req.start,
         "playlistend": req.end,
         "ignoreerrors": True,
@@ -214,13 +329,17 @@ def download_playlist_audio(req: PlaylistDownloadRequest, background_tasks: Back
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
         ],
     }
-    background_tasks.add_task(_run_download, job_id, ydl_opts, req.url)
+    background_tasks.add_task(_run_download, job_id, "playlist-audio", ydl_opts, req.url)
     return {"job_id": job_id, "status": JobStatus.PENDING}
 
 
 @app.post("/download/video")
-def download_video(req: SingleDownloadRequest, background_tasks: BackgroundTasks):
-    job_id = _new_job("video", req.url)
+def download_video(
+    req: SingleDownloadRequest,
+    background_tasks: BackgroundTasks,
+    owner_id: str = Depends(get_client_id),
+):
+    job_id = _new_job("video", req.url, owner_id)
     ydl_opts = {
         **_base_ydl_opts(),
         "format": "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[vcodec^=avc1]/bv*+ba/b",
@@ -228,55 +347,88 @@ def download_video(req: SingleDownloadRequest, background_tasks: BackgroundTasks
         "outtmpl": "Single Videos/%(title)s.%(ext)s",
         "ignoreerrors": False,
     }
-    background_tasks.add_task(_run_download, job_id, ydl_opts, req.url)
+    background_tasks.add_task(_run_download, job_id, "video", ydl_opts, req.url)
     return {"job_id": job_id, "status": JobStatus.PENDING}
 
 
 @app.post("/download/playlist-video")
-def download_playlist_video(req: PlaylistDownloadRequest, background_tasks: BackgroundTasks):
+def download_playlist_video(
+    req: PlaylistDownloadRequest,
+    background_tasks: BackgroundTasks,
+    owner_id: str = Depends(get_client_id),
+):
     if req.end < req.start:
         raise HTTPException(status_code=400, detail="end must be >= start")
 
-    job_id = _new_job("playlist-video", req.url)
+    job_id = _new_job("playlist-video", req.url, owner_id)
     ydl_opts = {
         **_base_ydl_opts(),
         "format": "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[vcodec^=avc1]/bv*+ba/b",
         "merge_output_format": "mp4",
-        "outtmpl": "Playlist Videos/%(playlist)s/%(playlist_index)s - %(title)s.%(ext)s",
+        "outtmpl": f"Playlist Videos/{job_id}/%(playlist_index)s - %(title)s.%(ext)s",
         "playliststart": req.start,
         "playlistend": req.end,
         "ignoreerrors": False,
     }
-    background_tasks.add_task(_run_download, job_id, ydl_opts, req.url)
+    background_tasks.add_task(_run_download, job_id, "playlist-video", ydl_opts, req.url)
     return {"job_id": job_id, "status": JobStatus.PENDING}
 
 
 @app.get("/jobs/{job_id}")
-def get_job(job_id: str):
-    job = _get_job(job_id)
+def get_job(job_id: str, owner_id: str = Depends(get_client_id)):
+    job = _get_job(job_id, owner_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
 
 
 @app.get("/jobs/{job_id}/file")
-def download_file(job_id: str):
-    job = _get_job(job_id)
+def download_file(job_id: str, owner_id: str = Depends(get_client_id)):
+    job = _get_job(job_id, owner_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job["status"] != JobStatus.COMPLETED:
         raise HTTPException(status_code=409, detail=f"Job is {job['status']}, not ready yet")
-    filepath = job.get("file")
-    if not filepath or not os.path.exists(filepath):
-        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    files = [f for f in job.get("files", []) if os.path.exists(f)]
+    if not files:
+        raise HTTPException(status_code=404, detail="File(s) not found on disk")
+
+    if len(files) == 1:
+        # Single file: serve directly, delete it (and its now-possibly-empty
+        # folder) once the response has finished sending.
+        filepath = files[0]
+        return FileResponse(
+            path=filepath,
+            filename=os.path.basename(filepath),
+            media_type="application/octet-stream",
+            background=BackgroundTask(_cleanup_paths, filepath),
+        )
+
+    # Multiple files (a playlist): zip them into a temp dir, serve the zip,
+    # then delete both the zip and every source file once sent.
+    tmp_dir = tempfile.mkdtemp(prefix="ytdlp_zip_")
+    zip_name = f"{job['type']}-{job_id[:8]}.zip"
+    zip_path = os.path.join(tmp_dir, zip_name)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in files:
+            zf.write(f, arcname=os.path.basename(f))
+
+    # Clean up the zip's temp dir, the original downloaded files, and their
+    # (now empty) playlist folder.
+    playlist_dirs = {os.path.dirname(f) for f in files}
+    cleanup_targets = [tmp_dir, *files, *playlist_dirs]
 
     return FileResponse(
-        path=filepath,
-        filename=os.path.basename(filepath),
-        media_type="application/octet-stream",
+        path=zip_path,
+        filename=zip_name,
+        media_type="application/zip",
+        background=BackgroundTask(_cleanup_paths, *cleanup_targets),
     )
 
 
 @app.get("/jobs")
-def list_jobs():
-    return list(jobs_collection.find({}, {"_id": 0}).sort("created_at", -1))
+def list_jobs(owner_id: str = Depends(get_client_id)):
+    return list(
+        jobs_collection.find({"owner_id": owner_id}, {"_id": 0}).sort("created_at", -1)
+    )
